@@ -2,6 +2,7 @@ const express = require('express');
 const { db, transaction } = require('./db');
 const { badRequest, notFound, forbidden, conflict, wrap } = require('./errors');
 const { authRequired } = require('./auth');
+const { assertPropInventoryAfterScheduleChanges, slotReservationsSummary } = require('./props');
 
 /**
  * 排练日程：导演为已有排练的某场次安排带时区的起止时段（同一场次可安排多段）。
@@ -403,6 +404,7 @@ function serializeSchedule(s, rehearsal) {
     pendingCast,
     attendance: attendanceSummary(s.id),
     notification: notificationSummary(s.id),
+    propReservations: slotReservationsSummary(s.id),
     createdAt: s.created_at,
     cancelledAt: s.cancelled_at,
   };
@@ -442,6 +444,8 @@ function serializeScheduleForActor(s, rehearsal, actorId) {
     myRoles: me?.roles ?? [],
     attendance: attendanceSummaryForActor(s.id, actorId),
     notification: notificationSummaryForActor(s.id, actorId),
+    // 仅列该时段已预约的共享道具与件数（列表已限定本人当前参与的有效时段，不含余量/他人预约）
+    propReservations: slotReservationsSummary(s.id),
   };
 }
 
@@ -582,6 +586,7 @@ router.patch(
     if (s.status === 'cancelled') throw badRequest('已取消的安排不能调整，请重新创建');
     const { sceneId, startAt, endAt } = validateSceneAndTimes(r, req.body, s);
     transaction(() => {
+      const becomesActive = s.status !== 'active';
       db.prepare(
         "UPDATE rehearsal_schedules SET scene_id = ?, start_at = ?, end_at = ?, status = 'active' WHERE id = ?"
       ).run(sceneId, startAt, endAt, s.id);
@@ -589,6 +594,13 @@ router.patch(
       const cand = buildCandidate({ scheduleId: s.id, rehearsal: r, sceneId, startAt, endAt });
       assertNoScheduleConflicts([cand]);
       assertNoUnavailabilityConflicts([cand], '参与演员在该时段已登记不可用，本次调整未生效');
+      // 既有道具预约随时段移动（待调整恢复有效时重新占用）；库存不足则整个调期操作不生效
+      assertPropInventoryAfterScheduleChanges(
+        new Map([[s.id, { start_at: startAt, end_at: endAt, status: 'active' }]]),
+        becomesActive
+          ? '时段恢复有效后共享道具库存不足，本次调整未生效'
+          : '调期后共享道具库存不足，本次调整未生效'
+      );
       // 起止/场次实质变化（或待调整恢复有效）-> 生成新通知批次；无实质变化不重复生成
       syncScheduleNotifications(r.id, 'adjust', req.user.id);
     });
@@ -658,6 +670,11 @@ router.post(
         candidates,
         '批量调整后参与演员在该时段已登记不可用，本次整批调整未生效'
       );
+      // 道具：既有预约随各时段移动（待调整时段合法化后重新占用）；按整批最终状态校验，不足整批回滚
+      const propChanges = new Map(
+        parsed.map((x) => [x.scheduleId, { start_at: x.startAt, end_at: x.endAt, status: 'active' }])
+      );
+      assertPropInventoryAfterScheduleChanges(propChanges, '批量调整后共享道具库存不足，本次整批调整未生效');
       // 仅实质变化（指纹不同，含待调整恢复有效）的时段生成新批次；未变化的不重发
       const created = syncScheduleNotifications(r.id, 'batch_adjust', req.user.id);
       return { created: new Map(created.map((x) => [x.scheduleId, x])) };

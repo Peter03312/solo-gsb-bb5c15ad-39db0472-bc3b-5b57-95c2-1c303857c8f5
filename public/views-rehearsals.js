@@ -294,6 +294,7 @@ function renderRehearsalDetail(data, reload) {
     <div style="margin-top:8px">
       <h3>日程安排（带时区时段；重叠即冲突，端点相接不算）</h3>
       <div class="schedRows muted">加载中…</div>
+      <div class="propDetail"></div>
       <div class="attDetail"></div>
       <div class="notifDetail"></div>
       <form class="flex schedForm" style="margin-top:6px">
@@ -509,6 +510,62 @@ async function showNotificationDetail(schedBox, rehearsal, scheduleId) {
     </div>`;
 }
 
+/** 导演：时段共享道具详情（本时段件数 + 时段内最低余量；可逐道具登记/撤销，0=撤销） */
+async function showSlotPropsDetail(schedBox, rehearsal, scheduleId) {
+  const box = schedBox.querySelector('.propDetail');
+  box.innerHTML = '<span class="muted">加载中…</span>';
+  let data;
+  try {
+    data = await api('GET', `/api/schedules/${scheduleId}/props`);
+  } catch (err) {
+    box.innerHTML = `<span class="muted">${esc(err.message)}</span>`;
+    return;
+  }
+  const { schedule, items } = data;
+  box.innerHTML = `
+    <div class="conflict" style="border-color:#8ca3b9;background:#f4f7fa">
+      <div class="kind" style="color:#2b2620">共享道具 · #${schedule.id} ${esc(schedule.sceneTitle)}
+        · ${fmtTime(schedule.startAt)} → ${fmtTime(schedule.endAt)}</div>
+      <div class="muted">余量按半开区间计算（端点相接可复用）；“时段内最低余量”不含本时段自身占用。
+        件数填 0 并保存即撤销该道具预约。</div>
+      <table style="margin-top:6px">
+        <tr><th>道具</th><th>总件数</th><th>本时段件数</th><th>时段内最低余量</th><th>占用峰值时段</th><th>目标件数</th><th></th></tr>
+        ${items
+          .map(
+            (it) => `<tr data-prop="${it.propId}">
+          <td>${esc(it.propName)}${it.propCode ? ` <span class="muted">(${esc(it.propCode)})</span>` : ''}</td>
+          <td>${it.totalCount}</td>
+          <td class="curQty">${it.reserved}</td>
+          <td>${it.minRemaining}</td>
+          <td class="muted">${it.otherPeakUsage > 0
+            ? it.peakSchedules.map((s) => `#${s.id} ${fmtTime(s.startAt)}→${fmtTime(s.endAt)}`).join('；')
+            : '—'}</td>
+          <td><input type="number" min="0" step="1" class="newQty" value="${it.reserved}" style="max-width:90px" /></td>
+          <td><button class="btn small saveQty">保存</button></td>
+        </tr>`
+          )
+          .join('')}
+      </table>
+    </div>`;
+  box.querySelectorAll('.saveQty').forEach((btn) =>
+    btn.addEventListener('click', async () => {
+      const tr = btn.closest('tr[data-prop]');
+      const propId = Number(tr.dataset.prop);
+      const quantity = Number(tr.querySelector('.newQty').value);
+      try {
+        const r = await api('PUT', `/api/rehearsals/${rehearsal.id}/schedules/${scheduleId}/props`, {
+          items: [{ propId, quantity }],
+        });
+        const it = r.slot.items.find((x) => x.propId === propId);
+        toast(quantity === 0 ? '已撤销该道具预约' : `已保存：本时段 ${quantity} 件`);
+        showSlotPropsDetail(schedBox, rehearsal, scheduleId);
+      } catch (err) {
+        toast(propInventoryErr(err), true);
+      }
+    })
+  );
+}
+
 /** 导演：登记详情（冻结的名单/缺口/统计） */
 async function showAttendanceDetail(schedBox, rehearsal, scheduleId) {
   const box = schedBox.querySelector('.attDetail');
@@ -653,6 +710,7 @@ function setupScheduleEditor(schedBox, rehearsal) {
       rowsBox.innerHTML = `<span class="muted">${esc(err.message)}</span>`;
       return;
     }
+    schedBox.querySelector('.propDetail').innerHTML = '';
     schedBox.querySelector('.attDetail').innerHTML = '';
     schedBox.querySelector('.notifDetail').innerHTML = '';
     // 已取消或不再存在的时段不能再纳入批量调整，从勾选集合中剔除
@@ -665,7 +723,7 @@ function setupScheduleEditor(schedBox, rehearsal) {
       return;
     }
     rowsBox.innerHTML = `<table>
-      <tr><th>选择</th><th>场次</th><th>时间</th><th>状态</th><th>参与演员</th><th>待补派</th><th>到场登记</th><th>知悉通知</th><th>操作</th></tr>
+      <tr><th>选择</th><th>场次</th><th>时间</th><th>状态</th><th>参与演员</th><th>待补派</th><th>共享道具</th><th>到场登记</th><th>知悉通知</th><th>操作</th></tr>
       ${schedules.map((s) => `<tr>
         <td>${s.status !== 'cancelled' ? `<input type="checkbox" class="pickSched" data-id="${s.id}"${batchIds.has(s.id) ? ' checked' : ''} />` : ''}</td>
         <td>${esc(s.sceneCode)} ${esc(s.sceneTitle)}</td>
@@ -673,6 +731,10 @@ function setupScheduleEditor(schedBox, rehearsal) {
         <td><span class="badge ${SCHED_STATUS_CLASS[s.status]}">${SCHED_STATUS_LABEL[s.status]}</span></td>
         <td>${s.participants.map((p) => esc(p.actorName)).join('、') || '<span class="muted">无</span>'}</td>
         <td>${s.pendingCast.map((p) => esc(p.roleName)).join('、') || '—'}</td>
+        <td>${(s.propReservations || []).length
+          ? s.propReservations.map((p) => `${esc(p.propName)} ×${p.quantity}`).join('、')
+          : '<span class="muted">—</span>'}
+          <div><button class="btn small viewProps" data-id="${s.id}">道具/余量</button></div></td>
         <td>${attendanceCell(s)}</td>
         <td>${notificationCell(s)}</td>
         <td>${s.status !== 'cancelled'
@@ -732,6 +794,10 @@ function setupScheduleEditor(schedBox, rehearsal) {
     // 时段通知：查看当前批次名单与历史
     rowsBox.querySelectorAll('.viewNotif').forEach((b) =>
       b.addEventListener('click', () => showNotificationDetail(schedBox, rehearsal, b.dataset.id))
+    );
+    // 共享道具：查看本时段预约与时段内最低余量，并可直接逐道具登记/撤销
+    rowsBox.querySelectorAll('.viewProps').forEach((b) =>
+      b.addEventListener('click', () => showSlotPropsDetail(schedBox, rehearsal, b.dataset.id))
     );
     rowsBox.querySelectorAll('.closeAtt').forEach((b) =>
       b.addEventListener('click', async () => {
@@ -827,6 +893,7 @@ async function loadActorHome() {
   }
   if (!rehearsals.length) card.innerHTML += '<p class="muted">你暂时没有被分配到任何排练。</p>';
   panel.appendChild(card);
+  panel.appendChild(await renderMyPropsCard());
   panel.appendChild(renderMyNotificationsCard());
   panel.appendChild(renderUnavailabilityCard());
 }
@@ -1028,10 +1095,17 @@ async function loadActorScript(rehearsalId) {
           <div class="meta">${esc(s.sceneCode)} ${esc(s.sceneTitle)} · ${(s.myRoles || []).map((r) => esc(r.roleName)).join('、')}</div>
           <div class="flex">
             <span class="grow">${fmtTime(s.startAt)} → ${fmtTime(s.endAt)}</span>
+            <span class="propsArea"></span>
             <span class="notifArea"></span>
             <span class="attArea"></span>
           </div>
         </div>`);
+      const pArea = row.querySelector('.propsArea');
+      if ((s.propReservations || []).length) {
+        pArea.innerHTML = `<span class="badge" title="本时段预约的共享道具">道具：${s.propReservations
+          .map((p) => `${esc(p.propName)}×${p.quantity}`)
+          .join('、')}</span>`;
+      }
       const nArea = row.querySelector('.notifArea');
       const notif = s.notification;
       if (notif) {

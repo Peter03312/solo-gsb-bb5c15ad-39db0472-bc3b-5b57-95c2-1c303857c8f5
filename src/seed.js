@@ -71,6 +71,29 @@ function seed() {
 
     // 示例日程自带一条时段通知批次（林晚、陈默待知悉确认）
     syncScheduleNotifications(rehearsal, 'create', director);
+
+    // 共享道具目录（全剧团共享，按有效时段占用库存）
+    // 油灯 2 盏、船桨 2 支、旧海图 1 份；示例时段预约 1 盏油灯、1 份旧海图
+    const lamp = db
+      .prepare('INSERT INTO props (code, name, total_count, created_by) VALUES (?, ?, ?, ?)')
+      .run('LAMP', '油灯', 2, director).lastInsertRowid;
+    db.prepare('INSERT INTO props (code, name, total_count, created_by) VALUES (?, ?, ?, ?)').run(
+      'OAR',
+      '船桨',
+      2,
+      director
+    );
+    const map = db
+      .prepare('INSERT INTO props (code, name, total_count, created_by) VALUES (?, ?, ?, ?)')
+      .run('MAP', '旧海图', 1, director).lastInsertRowid;
+    const seedScheduleId = db
+      .prepare('SELECT id FROM rehearsal_schedules WHERE rehearsal_id = ? ORDER BY id LIMIT 1')
+      .get(rehearsal).id;
+    const insRes = db.prepare(
+      'INSERT INTO schedule_prop_reservations (schedule_id, prop_id, quantity, created_by) VALUES (?, ?, ?, ?)'
+    );
+    insRes.run(seedScheduleId, lamp, 1, director);
+    insRes.run(seedScheduleId, map, 1, director);
   });
 
   return true;

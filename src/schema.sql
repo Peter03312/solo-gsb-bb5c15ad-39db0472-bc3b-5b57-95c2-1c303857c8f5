@@ -306,6 +306,37 @@ CREATE TABLE IF NOT EXISTS schedule_notifications (
 CREATE INDEX IF NOT EXISTS idx_notifications_schedule ON schedule_notifications(schedule_id);
 CREATE INDEX IF NOT EXISTS idx_notifications_rehearsal ON schedule_notifications(rehearsal_id);
 
+-- 剧团共享道具目录：导演登记总件数（非负整数），全局共享、跨排练占用同一库存
+CREATE TABLE IF NOT EXISTS props (
+  id          INTEGER PRIMARY KEY,
+  code        TEXT NOT NULL DEFAULT '',    -- 可选短码（非空时全剧团唯一）
+  name        TEXT NOT NULL,
+  total_count INTEGER NOT NULL DEFAULT 0 CHECK (total_count >= 0),
+  created_by  INTEGER REFERENCES users(id),
+  created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_props_code
+  ON props(code) WHERE code <> '';
+
+-- 时段道具预约：每个“时段 × 道具”至多一行，quantity 为非负整数目标件数。
+--   * 仅 status='active' 的时段预约占用库存；已取消/待调整时段的预约保留但不占用，
+--     待调整恢复有效时随重新校验；取消时释放占用。
+--   * 占用按 UTC 归一化后的半开区间 [start_at, end_at) 计算：端点相接可复用。
+--   * 行随“单条/批量预约、调期（随时段移动）、库存下调”等操作的同一事务写入，
+--     库存不足（同一道具任一时刻预约总量超过 total_count）时整批回滚。
+CREATE TABLE IF NOT EXISTS schedule_prop_reservations (
+  id          INTEGER PRIMARY KEY,
+  schedule_id INTEGER NOT NULL REFERENCES rehearsal_schedules(id) ON DELETE CASCADE,
+  prop_id     INTEGER NOT NULL REFERENCES props(id) ON DELETE CASCADE,
+  quantity    INTEGER NOT NULL CHECK (quantity >= 0),
+  created_by  INTEGER REFERENCES users(id),
+  updated_by  INTEGER REFERENCES users(id),
+  updated_at  TEXT,
+  UNIQUE (schedule_id, prop_id)
+);
+CREATE INDEX IF NOT EXISTS idx_prop_res_prop ON schedule_prop_reservations(prop_id);
+CREATE INDEX IF NOT EXISTS idx_prop_res_schedule ON schedule_prop_reservations(schedule_id);
+
 -- 批次接收人（生成时冻结的当时参与演员及其角色）；confirmed_at 为空 = 待确认。
 -- 确认幂等：重试返回首次确认时间；过期（非 current）批次的确认被拒绝。
 CREATE TABLE IF NOT EXISTS schedule_notification_recipients (
