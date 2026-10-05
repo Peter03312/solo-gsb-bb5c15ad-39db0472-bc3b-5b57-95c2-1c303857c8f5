@@ -233,14 +233,13 @@ async function main() {
   check('s2 标注“原演员确认不计入”', !!s2p && s2p.reason.includes('改派'), s2p?.reason);
   check('改派后原演员不再出现在待确认（她已无角色）', !rehView.pending.some((p) => p.actorId === linId));
   // 周海用演员视角看稿，只能看到守塔人台词
-  const zhouToken = await login('zhou', 'actor123');
-  const script = await G(`/api/rehearsals/${reh.id}/script`, zhouToken);
+  const script = await G(`/api/rehearsals/${reh.id}/script`, zhou);
   check('演员排练稿只含所派角色', script.lines.every((l) => l.roleId === keeperRole) && script.lines.length > 0);
 
   // 换版到 v3（删掉了船员的句子）；未派船员，只看守塔人：v3 守塔人内容与 v2 相同 => 无需再确认
   // 先把 s1 确认掉
-  await J(`/api/rehearsals/${reh.id}/confirm`, zhouToken, { roleId: keeperRole, sceneId: detail.scenes[0].id });
-  await J(`/api/rehearsals/${reh.id}/confirm`, zhouToken, { roleId: keeperRole, sceneId: detail.scenes[1].id });
+  await J(`/api/rehearsals/${reh.id}/confirm`, zhou, { roleId: keeperRole, sceneId: detail.scenes[0].id });
+  await J(`/api/rehearsals/${reh.id}/confirm`, zhou, { roleId: keeperRole, sceneId: detail.scenes[1].id });
   const sw3 = await J(`/api/rehearsals/${reh.id}/switch-version`, director, { versionId: 3 }, 200);
   check('v2→v3 守塔人无文本变化 => 无待确认', !sw3.pending.some((p) => p.actorId === zhouId), JSON.stringify(sw3.pending));
 
@@ -1256,6 +1255,271 @@ async function main() {
   const prevP5b = await J(`/api/rehearsals/${rhP5}/switch-version/preview`, director, { versionId: pv2 }, 200);
   const okCommit5 = await J(`/api/rehearsals/${rhP5}/switch-version/commit`, director, { versionId: pv2, previewToken: prevP5b.previewToken }, 200);
   check('撤销不可用后提交成功', okCommit5.rehearsal.versionId === pv2);
+
+  console.log('— 共享道具：登记 / 权限 / 入参拒绝 —');
+  // 种子数据自带 3 个道具与示例时段预约（2026-10 的种子时段，不影响本轮 2035 用例）
+  const seedProps = await G('/api/props', director);
+  check('导演可查看道具登记册（含种子道具）', seedProps.props.length >= 3, JSON.stringify(seedProps));
+  await G('/api/props', lin, 403);
+  await G('/api/props', null, 401);
+  check('演员不可查看道具登记册；未登录 401', true);
+  const propCrate = await J('/api/props', director, { name: '道具箱E2E', totalCount: 2 }, 201);
+  const crateId = propCrate.prop.id;
+  check('登记道具返回总件数与占用统计', propCrate.prop.totalCount === 2 && propCrate.prop.peakReserved === 0);
+  await J('/api/props', lin, { name: 'x', totalCount: 1 }, 403);
+  await J('/api/props', director, { name: '道具箱E2E', totalCount: 1 }, 400);
+  await J('/api/props', director, { name: '无件数道具' }, 400);
+  await J('/api/props', director, { name: '负数道具', totalCount: -1 }, 400);
+  await J('/api/props', director, { name: '小数道具', totalCount: 1.5 }, 400);
+  await J('/api/props', director, { name: '字符串件数', totalCount: '2' }, 400);
+  await J('/api/props', director, { name: '布尔件数', totalCount: true }, 400);
+  check('重复名称/无效件数/演员调用一律拒绝', true);
+  await req('PATCH', `/api/props/${crateId}`, director, {}, 400);
+  await req('PATCH', `/api/props/99999`, director, { totalCount: 1 }, 404);
+
+  console.log('— 共享道具：预约、余量、半开区间与整批校验 —');
+  // 两个演员互不重叠的排练：PR_X=林晚+陈默，PR_Y=周海（道具占用跨排练叠加）
+  const rhX = (await J(`/api/plays/${p2.id}/rehearsals`, director, { versionId: pv1, name: '道具排练X' }, 201)).id;
+  await J(`/api/rehearsals/${rhX}/cast`, director, { roleId: roleA, actorId: linId }, 201);
+  await J(`/api/rehearsals/${rhX}/cast`, director, { roleId: roleB, actorId: chenId }, 201);
+  const rhY = (await J(`/api/plays/${p2.id}/rehearsals`, director, { versionId: pv1, name: '道具排练Y' }, 201)).id;
+  await J(`/api/rehearsals/${rhY}/cast`, director, { roleId: roleA, actorId: zhouId }, 201);
+  const mk = (rh, st, en, scene = sc1) =>
+    J(`/api/rehearsals/${rh}/schedules`, director, { sceneId: scene, startAt: st, endAt: en }, 201);
+  const x1 = (await mk(rhX, '2035-06-01T10:00:00Z', '2035-06-01T11:00:00Z')).schedule;
+  const y1 = (await mk(rhY, '2035-06-01T10:30:00Z', '2035-06-01T11:30:00Z')).schedule;
+  const yTouch = (await mk(rhY, '2035-06-01T11:30:00Z', '2035-06-01T12:30:00Z')).schedule;
+  // x1 预约道具箱 1
+  const vx1 = await req('PUT', `/api/rehearsals/${rhX}/schedules/${x1.id}/props`, director,
+    { items: [{ propId: crateId, quantity: 1 }] }, 200);
+  check('单时段预约成功并返回时段内最低余量', vx1.ok && vx1.minRemaining === 1
+    && vx1.props[0].quantity === 1 && vx1.props[0].peakReservedInSlot === 1, JSON.stringify(vx1));
+  // y1 与 x1 重叠：预约 2 件 -> 峰值 3 > 2，409
+  const over = await req('PUT', `/api/rehearsals/${rhY}/schedules/${y1.id}/props`, director,
+    { items: [{ propId: crateId, quantity: 2 }] }, 409);
+  check('重叠超库存 -> 409 PROP_CAPACITY_CONFLICT 且返回道具/冲突时段/缺口',
+    over.error === 'PROP_CAPACITY_CONFLICT'
+      && over.details.shortages[0].propId === crateId
+      && over.details.shortages[0].shortage === 1
+      && over.details.shortages[0].peakReserved === 3
+      && over.details.shortages[0].schedules.some((s) => s.id === x1.id)
+      && over.details.shortages[0].schedules.some((s) => s.id === y1.id),
+    JSON.stringify(over.details));
+  const vy1After = await G(`/api/rehearsals/${rhY}/schedules/${y1.id}/props`, director);
+  check('失败后预约不生效', vy1After.props.length === 0, JSON.stringify(vy1After));
+  // y1 预约 1 件：峰值 2 == 2 成功
+  const vy1Ok = await req('PUT', `/api/rehearsals/${rhY}/schedules/${y1.id}/props`, director,
+    { items: [{ propId: crateId, quantity: 1 }] }, 200);
+  check('重叠但总量恰为库存 -> 成功，时段内最低余量 0', vy1Ok.minRemaining === 0);
+  // yTouch 与 y1 端点相接（11:30）：可再用满 2 件
+  const vyTouch = await req('PUT', `/api/rehearsals/${rhY}/schedules/${yTouch.id}/props`, director,
+    { items: [{ propId: crateId, quantity: 2 }] }, 200);
+  check('端点相接可复用：相接时段可各用满库存', vyTouch.ok && vyTouch.minRemaining === 0);
+  // 入参拒绝
+  await req('PUT', `/api/rehearsals/${rhX}/schedules/${x1.id}/props`, director,
+    { items: [{ propId: 99999, quantity: 1 }] }, 400);
+  await req('PUT', `/api/rehearsals/${rhX}/schedules/99999/props`, director, { items: [] }, 404);
+  await req('PUT', `/api/rehearsals/999/schedules/${x1.id}/props`, director, { items: [] }, 404);
+  await req('PUT', `/api/rehearsals/${rhX}/schedules/${x1.id}/props`, director,
+    { items: [{ propId: crateId, quantity: -2 }] }, 400);
+  await req('PUT', `/api/rehearsals/${rhX}/schedules/${x1.id}/props`, director,
+    { items: [{ propId: crateId, quantity: 2.5 }] }, 400);
+  const dup = await J('/api/schedules/props/batch', director, {
+    items: [
+      { scheduleId: x1.id, propId: crateId, quantity: 1 },
+      { scheduleId: x1.id, propId: crateId, quantity: 2 },
+    ],
+  }, 400);
+  check('同批重复 (时段,道具) 组合 400', /重复/.test(dup.message), dup.message);
+  await J('/api/schedules/props/batch', director, { items: [{ scheduleId: x1.id, propId: crateId, quantity: 1 }] }, 400);
+  await req('POST', '/api/schedules/props/batch', director, { items: 'nope' }, 400);
+  await J('/api/schedules/props/batch', director, {
+    items: [{ scheduleId: 99999, propId: crateId, quantity: 1 }, { scheduleId: x1.id, propId: crateId, quantity: 1 }],
+  }, 404);
+  await req('PUT', `/api/rehearsals/${rhX}/schedules/${x1.id}/props`, lin,
+    { items: [{ propId: crateId, quantity: 1 }] }, 403);
+  check('未知道具/时段、无效件数、批量不足两条、演员调用均明确拒绝', true);
+
+  console.log('— 共享道具：撤销(0)与未列出道具不变 —');
+  const keep = await req('PUT', `/api/rehearsals/${rhX}/schedules/${x1.id}/props`, director,
+    { items: [{ propId: crateId, quantity: 1 }] }, 200);
+  check('同值重提幂等（保持 1 件）', keep.props.length === 1);
+  // 再登记一个道具：撤销目标道具时，未列出的另一道具保持不变
+  const propFlag = (await J('/api/props', director, { name: '令旗E2E', totalCount: 5 }, 201)).prop.id;
+  await req('PUT', `/api/rehearsals/${rhX}/schedules/${x1.id}/props`, director,
+    { items: [{ propId: propFlag, quantity: 3 }] }, 200);
+  const revoked = await req('PUT', `/api/rehearsals/${rhX}/schedules/${x1.id}/props`, director,
+    { items: [{ propId: crateId, quantity: 0 }] }, 200);
+  check('quantity=0 撤销该道具；未列出的道具保持不变',
+    !revoked.props.some((p) => p.propId === crateId)
+      && revoked.props.some((p) => p.propId === propFlag && p.quantity === 3),
+    JSON.stringify(revoked.props));
+
+  console.log('— 共享道具：跨时段整批修改按最终状态校验 —');
+  // 撤销令旗，恢复道具箱基线：x1=1、y1=1（10:30-11:30，重叠峰值 2）
+  await req('PUT', `/api/rehearsals/${rhX}/schedules/${x1.id}/props`, director,
+    { items: [{ propId: propFlag, quantity: 0 }, { propId: crateId, quantity: 1 }] }, 200);
+  // 最终 x1=1（10-11）、y1=1（10:30-11:30）-> 峰值 2，成功
+  const batchOk = await J('/api/schedules/props/batch', director, {
+    items: [
+      { scheduleId: x1.id, propId: crateId, quantity: 1 },
+      { scheduleId: y1.id, propId: crateId, quantity: 1 },
+    ],
+  }, 200);
+  check('批量按整批最终状态生效', batchOk.ok && batchOk.schedules.length === 2
+    && batchOk.schedules.find((s) => s.schedule.id === x1.id).minRemaining === 0, JSON.stringify(batchOk.schedules));
+  // 整批失败：x1=2, y1=1 -> 峰值 3 > 2
+  const batchFail = await J('/api/schedules/props/batch', director, {
+    items: [
+      { scheduleId: x1.id, propId: crateId, quantity: 2 },
+      { scheduleId: y1.id, propId: crateId, quantity: 1 },
+    ],
+  }, 409);
+  check('批量任一时刻不足 -> 整批不生效并返回缺口',
+    batchFail.error === 'PROP_CAPACITY_CONFLICT' && batchFail.details.shortages[0].shortage === 1);
+  const afterX = await G(`/api/rehearsals/${rhX}/schedules/${x1.id}/props`, director);
+  const afterY = await G(`/api/rehearsals/${rhY}/schedules/${y1.id}/props`, director);
+  check('整批失败后两条均保持原值',
+    afterX.props.find((p) => p.propId === crateId).quantity === 1
+      && afterY.props.find((p) => p.propId === crateId).quantity === 1,
+    JSON.stringify([afterX.props, afterY.props]));
+  // 批次内互换件数（x1=1,y1=1 同值）后改为 x1=0、y1=2：最终峰值 y1 独占 2，成功
+  const batchShift = await J('/api/schedules/props/batch', director, {
+    items: [
+      { scheduleId: x1.id, propId: crateId, quantity: 0 },
+      { scheduleId: y1.id, propId: crateId, quantity: 2 },
+    ],
+  }, 200);
+  check('批量可在最终状态下把占用从一个时段移到另一个时段',
+    batchShift.schedules.find((s) => s.schedule.id === y1.id).props.find((p) => p.propId === crateId).quantity === 2);
+
+  console.log('— 共享道具：调期携带预约移动（库存不足整体不生效）—');
+  // 基线：y1=2（10:30-11:30），x1 无道具箱
+  // y1 调期到 10:00-11:00 仍独占 2 件：成功
+  await req('PATCH', `/api/rehearsals/${rhY}/schedules/${y1.id}`, director,
+    { startAt: '2035-06-01T10:00:00Z', endAt: '2035-06-01T11:00:00Z' }, 200);
+  // x1 重新预约 1 件：与 y1 完全重合 -> 峰值 3，失败
+  const bumpX = await req('PUT', `/api/rehearsals/${rhX}/schedules/${x1.id}/props`, director,
+    { items: [{ propId: crateId, quantity: 1 }] }, 409);
+  check('重合时段加件超库存失败', bumpX.error === 'PROP_CAPACITY_CONFLICT');
+  // 把 y1 调期到与 x1 完全重合（y1 持 2、x1 无）— 先给 x1 占 1 件需要 y1 移开：
+  // y1 调到 08:00-09:00（与任何时段不重叠）后，x1 可预约 2 件
+  await req('PATCH', `/api/rehearsals/${rhY}/schedules/${y1.id}`, director,
+    { startAt: '2035-06-01T08:00:00Z', endAt: '2035-06-01T09:00:00Z' }, 200);
+  await req('PUT', `/api/rehearsals/${rhX}/schedules/${x1.id}/props`, director,
+    { items: [{ propId: crateId, quantity: 2 }] }, 200);
+  // y1（持 2）调期回与 x1 重叠 -> 原日程操作整体不生效，时间不动
+  const moveFail = await req('PATCH', `/api/rehearsals/${rhY}/schedules/${y1.id}`, director,
+    { startAt: '2035-06-01T10:30:00Z', endAt: '2035-06-01T11:30:00Z' }, 409);
+  check('调期携带预约移动后超库存 -> 409 且原日程操作整体不生效',
+    moveFail.error === 'PROP_CAPACITY_CONFLICT'
+      && moveFail.details.shortages[0].schedules.some((s) => s.id === x1.id)
+      && moveFail.details.shortages[0].schedules.some((s) => s.id === y1.id),
+    JSON.stringify(moveFail.details));
+  const y1Kept = await G(`/api/rehearsals/${rhY}/schedules/${y1.id}/props`, director);
+  check('调期失败后时间与预约均不变', y1Kept.schedule.startAt === '2035-06-01T08:00:00.000Z'
+    && y1Kept.props.find((p) => p.propId === crateId).quantity === 2);
+
+  console.log('— 共享道具：下调库存校验 / 取消释放占用 —');
+  // 占用峰值：x1=2（10-11）、y1=2（08-09）、yTouch=2（11:30-12:30），互不重叠
+  await req('PATCH', `/api/props/${crateId}`, director, { totalCount: 2 }, 200);
+  const lowerFail = await req('PATCH', `/api/props/${crateId}`, director, { totalCount: 1 }, 409);
+  check('下调库存不足 -> 409 且整次不生效（返回缺口时段与缺口数）', lowerFail.error === 'PROP_CAPACITY_CONFLICT'
+    && lowerFail.details.shortages[0].propId === crateId
+    && lowerFail.details.shortages[0].totalCount === 1
+    && lowerFail.details.shortages[0].peakReserved === 2
+    && lowerFail.details.shortages[0].shortage === 1
+    && [x1.id, y1.id].some((id) => lowerFail.details.shortages[0].schedules.some((s) => s.id === id)));
+  check('下调失败库存保持 2',
+    (await G('/api/props', director)).props.find((p) => p.id === crateId).totalCount === 2);
+  // 已取消时段不能改预约；记录保留但不占用
+  await J(`/api/rehearsals/${rhY}/schedules/${yTouch.id}/cancel`, director, {}, 200);
+  await req('PUT', `/api/rehearsals/${rhY}/schedules/${yTouch.id}/props`, director,
+    { items: [{ propId: crateId, quantity: 1 }] }, 400);
+  const cancelledView = await G(`/api/rehearsals/${rhY}/schedules/${yTouch.id}/props`, director);
+  check('已取消时段预约记录可查但不占用（occupying=false, minRemaining=null）',
+    cancelledView.status === 'cancelled'
+      && cancelledView.props.every((p) => p.occupying === false && p.minRemaining === null),
+    JSON.stringify(cancelledView));
+  // 取消 x1、y1 释放占用 -> 库存可下调到 0（令旗 5 不受影响）
+  await J(`/api/rehearsals/${rhX}/schedules/${x1.id}/cancel`, director, {}, 200);
+  await J(`/api/rehearsals/${rhY}/schedules/${y1.id}/cancel`, director, {}, 200);
+  await req('PATCH', `/api/props/${crateId}`, director, { totalCount: 0 }, 200);
+  check('全部取消后库存释放，可下调总件数到 0', true);
+
+  console.log('— 共享道具：待调整释放占用，恢复有效时重新校验 —');
+  const propAdj = (await J('/api/props', director, { name: '待调整道具E2E', totalCount: 1 }, 201)).prop.id;
+  // rhZ 固定 pv1：甲=周海，乙=林晚（pv1 中乙仅 sc2 有台词）；spZ 排 sc2
+  const rhZ = (await J(`/api/plays/${p2.id}/rehearsals`, director, { versionId: pv1, name: '待调整排练Z' }, 201)).id;
+  await J(`/api/rehearsals/${rhZ}/cast`, director, { roleId: roleA, actorId: zhouId }, 201);
+  await J(`/api/rehearsals/${rhZ}/cast`, director, { roleId: roleB, actorId: linId }, 201);
+  const spZ = (await J(`/api/rehearsals/${rhZ}/schedules`, director,
+    { sceneId: sc2, startAt: '2035-07-01T10:00:00Z', endAt: '2035-07-01T11:00:00Z' }, 201)).schedule;
+  await req('PUT', `/api/rehearsals/${rhZ}/schedules/${spZ.id}/props`, director,
+    { items: [{ propId: propAdj, quantity: 1 }] }, 200);
+  // pv3 删除了 sc2 全部台词：换版后 spZ 转待调整（若按 pv1 的原参与者重算会有林晚撞其他日程的风险，
+  // 故 rhZ 只使用 2035-07 专属时间）
+  const swZ = await J(`/api/rehearsals/${rhZ}/switch-version`, director, { versionId: pv3 }, 200);
+  check('换版后无台词场次的时段转待调整', swZ.needsAdjustmentSchedules.includes(spZ.id),
+    JSON.stringify(swZ.needsAdjustmentSchedules));
+  const zNA = await G(`/api/rehearsals/${rhZ}/schedules/${spZ.id}/props`, director);
+  check('待调整时段：预约保留但不占用', zNA.status === 'needs_adjustment'
+    && zNA.props[0].quantity === 1 && zNA.props[0].occupying === false, JSON.stringify(zNA));
+  // 待调整期间可改预约（不校验库存）
+  await req('PUT', `/api/rehearsals/${rhZ}/schedules/${spZ.id}/props`, director,
+    { items: [{ propId: propAdj, quantity: 1 }] }, 200);
+  // 另一有效时段（陈默，pv2 的 sc2 有乙台词）占用同一道具、时间重叠
+  const rhPW = (await J(`/api/plays/${p2.id}/rehearsals`, director, { versionId: pv2, name: '待调整排练W' }, 201)).id;
+  await J(`/api/rehearsals/${rhPW}/cast`, director, { roleId: roleB, actorId: chenId }, 201);
+  const spPW = (await J(`/api/rehearsals/${rhPW}/schedules`, director,
+    { sceneId: sc2, startAt: '2035-07-01T10:00:00Z', endAt: '2035-07-01T11:00:00Z' }, 201)).schedule;
+  await req('PUT', `/api/rehearsals/${rhPW}/schedules/${spPW.id}/props`, director,
+    { items: [{ propId: propAdj, quantity: 1 }] }, 200);
+  // spZ 恢复有效（改到 pv3 中仍有台词的 sc1）：库存被 spPW 占满 -> 整体不生效，保持待调整
+  const restoreFail = await req('PATCH', `/api/rehearsals/${rhZ}/schedules/${spZ.id}`, director,
+    { sceneId: sc1, startAt: '2035-07-01T10:00:00Z', endAt: '2035-07-01T11:00:00Z' }, 409);
+  check('待调整恢复有效时重新校验库存：不足则原日程操作整体不生效',
+    restoreFail.error === 'PROP_CAPACITY_CONFLICT'
+      && restoreFail.details.shortages[0].propId === propAdj
+      && restoreFail.details.shortages[0].schedules.some((s) => s.id === spPW.id)
+      && restoreFail.details.shortages[0].schedules.some((s) => s.id === spZ.id),
+    JSON.stringify(restoreFail.details));
+  const stillNA = await G(`/api/rehearsals/${rhZ}/schedules/${spZ.id}/props`, director);
+  check('恢复失败后仍为待调整、预约保留', stillNA.status === 'needs_adjustment'
+    && stillNA.props[0].quantity === 1);
+  // spPW 移到端点相接（09:00-10:00）-> spZ 恢复成功
+  await req('PATCH', `/api/rehearsals/${rhPW}/schedules/${spPW.id}`, director,
+    { startAt: '2035-07-01T09:00:00Z', endAt: '2035-07-01T10:00:00Z' }, 200);
+  const restoreOk = await req('PATCH', `/api/rehearsals/${rhZ}/schedules/${spZ.id}`, director,
+    { sceneId: sc1, startAt: '2035-07-01T10:00:00Z', endAt: '2035-07-01T11:00:00Z' }, 200);
+  check('占用解除后待调整时段恢复有效', restoreOk.schedule.status === 'active'
+    && restoreOk.schedule.sceneId === sc1, JSON.stringify(restoreOk.schedule));
+  const zActive = await G(`/api/rehearsals/${rhZ}/schedules/${spZ.id}/props`, director);
+  check('恢复后预约重新占用（occupying=true, 最低余量 0）',
+    zActive.props[0].occupying === true && zActive.props[0].minRemaining === 0);
+
+  console.log('— 共享道具：演员只可见自己当前参与有效时段的道具清单 —');
+  await G(`/api/rehearsals/${rhY}/schedules/${y1.id}/props`, chen, 403);
+  await G(`/api/rehearsals/${rhY}/schedules/${y1.id}/props`, null, 401);
+  await G(`/api/rehearsals/${rhZ}/schedules/${spZ.id}/props`, chen, 403);
+  check('非参与演员/未登录看不到时段道具清单（含跨排练隔离）', true);
+  const chenView = await G(`/api/rehearsals/${rhPW}/schedules/${spPW.id}/props`, chen);
+  check('参与演员看到本时段道具清单（仅名称与件数，无库存/余量/其他时段）',
+    chenView.scheduleId === spPW.id && chenView.props.length === 1
+      && chenView.props[0].propId === propAdj && chenView.props[0].quantity === 1
+      && chenView.props[0].totalCount === undefined && chenView.minRemaining === undefined,
+    JSON.stringify(chenView));
+  await G(`/api/rehearsals/${rhPW}/schedules/${spPW.id}/props`, zhou, 403);
+  check('不参与演员 403，不能读取其他预约', true);
+  const chenScheds = await G(`/api/rehearsals/${rhPW}/schedules`, chen);
+  check('演员日程列表自带 props 清单',
+    chenScheds.schedules.some((s) => s.id === spPW.id && Array.isArray(s.props)
+      && s.props.some((p) => p.propId === propAdj)), JSON.stringify(chenScheds.schedules));
+  const dirScheds = await G(`/api/rehearsals/${rhPW}/schedules`, director);
+  check('导演日程列表含道具预约简表',
+    dirScheds.schedules.some((s) => s.id === spPW.id && s.props.some((p) => p.propId === propAdj)));
+  // 已取消时段对任何人都不作为“有效清单”：演员看不到（参与者也不行）
+  await G(`/api/rehearsals/${rhY}/schedules/${yTouch.id}/props`, zhou, 403);
 
   console.log(failures === 0 ? '\n全部通过 🎉' : `\n${failures} 项失败`);
   process.exit(failures === 0 ? 0 : 1);

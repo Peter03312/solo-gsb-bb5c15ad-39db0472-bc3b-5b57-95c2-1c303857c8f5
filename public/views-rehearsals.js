@@ -665,7 +665,7 @@ function setupScheduleEditor(schedBox, rehearsal) {
       return;
     }
     rowsBox.innerHTML = `<table>
-      <tr><th>选择</th><th>场次</th><th>时间</th><th>状态</th><th>参与演员</th><th>待补派</th><th>到场登记</th><th>知悉通知</th><th>操作</th></tr>
+      <tr><th>选择</th><th>场次</th><th>时间</th><th>状态</th><th>参与演员</th><th>待补派</th><th>道具预约</th><th>到场登记</th><th>知悉通知</th><th>操作</th></tr>
       ${schedules.map((s) => `<tr>
         <td>${s.status !== 'cancelled' ? `<input type="checkbox" class="pickSched" data-id="${s.id}"${batchIds.has(s.id) ? ' checked' : ''} />` : ''}</td>
         <td>${esc(s.sceneCode)} ${esc(s.sceneTitle)}</td>
@@ -673,6 +673,8 @@ function setupScheduleEditor(schedBox, rehearsal) {
         <td><span class="badge ${SCHED_STATUS_CLASS[s.status]}">${SCHED_STATUS_LABEL[s.status]}</span></td>
         <td>${s.participants.map((p) => esc(p.actorName)).join('、') || '<span class="muted">无</span>'}</td>
         <td>${s.pendingCast.map((p) => esc(p.roleName)).join('、') || '—'}</td>
+        <td><span class="propBrief">${(s.props || []).map((p) => `${esc(p.propName)}×${p.quantity}`).join('、') || '<span class="muted">—</span>'}</span>
+            <button class="btn small viewProps" data-id="${s.id}">道具</button></td>
         <td>${attendanceCell(s)}</td>
         <td>${notificationCell(s)}</td>
         <td>${s.status !== 'cancelled'
@@ -703,6 +705,10 @@ function setupScheduleEditor(schedBox, rehearsal) {
           reloadSchedules();
         } catch (err) { toast(scheduleErr(err), true); }
       })
+    );
+    // 道具预约：打开该时段的道具编辑弹窗（含最低余量）
+    rowsBox.querySelectorAll('.viewProps').forEach((b) =>
+      b.addEventListener('click', () => openSchedulePropsDialog(rehearsal.id, Number(b.dataset.id)))
     );
     rowsBox.querySelectorAll('.editSched').forEach((b) =>
       b.addEventListener('click', () => {
@@ -743,6 +749,10 @@ function setupScheduleEditor(schedBox, rehearsal) {
       })
     );
   }
+
+  // 道具弹窗保存后由 views-props.js 调用的刷新入口（仅刷新当前打开的日程表）
+  // eslint-disable-next-line no-global-assign
+  window.reloadScheduleTable = reloadSchedules;
 
   schedBox.querySelector('.schedForm').addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -1026,6 +1036,7 @@ async function loadActorScript(rehearsalId) {
       const row = el(`
         <div class="line-row">
           <div class="meta">${esc(s.sceneCode)} ${esc(s.sceneTitle)} · ${(s.myRoles || []).map((r) => esc(r.roleName)).join('、')}</div>
+          ${(s.props && s.props.length) ? `<div class="muted">共享道具：${s.props.map((p) => `${esc(p.propName)}×${p.quantity}`).join('、')}</div>` : ''}
           <div class="flex">
             <span class="grow">${fmtTime(s.startAt)} → ${fmtTime(s.endAt)}</span>
             <span class="notifArea"></span>

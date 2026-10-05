@@ -110,6 +110,7 @@ document.querySelectorAll('.tab').forEach((tab) => {
     if (name === 'plays') loadPlaysTab();
     if (name === 'revisions') loadRevisionsTab();
     if (name === 'rehearsals') loadRehearsalsTab();
+    if (name === 'props') loadPropsTab();
     if (name === 'dashboard') loadDashboard();
   });
 });

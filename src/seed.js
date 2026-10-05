@@ -65,12 +65,26 @@ function seed() {
     db.prepare('INSERT INTO rehearsal_cast (rehearsal_id, role_id, actor_id) VALUES (?, ?, ?)').run(rehearsal, rChen, chen);
 
     // 示例日程：场次 I 的对词时段（带时区提交，服务端归一化为 UTC 存储）
-    db.prepare(
-      'INSERT INTO rehearsal_schedules (rehearsal_id, scene_id, start_at, end_at, created_by) VALUES (?, ?, ?, ?, ?)'
-    ).run(rehearsal, s1, '2026-10-10T06:00:00.000Z', '2026-10-10T07:30:00.000Z', director);
+    const seedSchedule = db
+      .prepare(
+        'INSERT INTO rehearsal_schedules (rehearsal_id, scene_id, start_at, end_at, created_by) VALUES (?, ?, ?, ?, ?)'
+      )
+      .run(rehearsal, s1, '2026-10-10T06:00:00.000Z', '2026-10-10T07:30:00.000Z', director)
+      .lastInsertRowid;
 
     // 示例日程自带一条时段通知批次（林晚、陈默待知悉确认）
     syncScheduleNotifications(rehearsal, 'create', director);
+
+    // 剧团共享道具：登记总件数，并为示例时段预约（0 件即撤销，故此处直接登记正数）
+    const insProp = db.prepare('INSERT INTO props (name, total_count, created_by) VALUES (?, ?, ?)');
+    const propLamp = insProp.run('煤油灯', 2, director).lastInsertRowid;
+    const propSword = insProp.run('道具佩剑', 1, director).lastInsertRowid;
+    insProp.run('旧航海图', 1, director);
+    const insRes = db.prepare(
+      'INSERT INTO prop_reservations (schedule_id, prop_id, quantity, updated_by) VALUES (?, ?, ?, ?)'
+    );
+    insRes.run(seedSchedule, propLamp, 1, director);
+    insRes.run(seedSchedule, propSword, 1, director);
   });
 
   return true;

@@ -135,6 +135,28 @@
 5. 批次与源操作**同一事务**提交：排期/不可用冲突导致源操作失败时**不会留下批次**；
    已开启的**到场登记名单**与台词**逐场确认**不受通知影响。
 
+### 剧团共享道具（按排练时段预约）
+
+1. 导演**登记**各共享道具的**非负整数总件数**（库存），道具名不可重复；可随时**调整总量**（可选改名）。
+   **下调**总量时按全部**有效**预约校验：任一时刻不足则整次不生效（`409 PROP_CAPACITY_CONFLICT`），库存保持原值。
+2. 导演为时段**填写道具及非负整数目标件数**（`0` 表示撤销该道具的预约；同值重提幂等）。
+   **无效件数**（负数/小数/非数字）、**未知道具或时段**、**同批重复的（时段 × 道具）组合**一律 `400/404` 明确拒绝。
+3. **只有有效（`active`）时段占用库存**：
+   - 时段**取消**、或**换版转待调整**时，其预约**释放占用**（预约记录保留可查，不回显给其他无关人员）；
+   - 已取消时段不能再改道具预约；**待调整时段可编辑但不占用**，经单条/批量调期**恢复有效时重新校验**库存；
+   - 单条及**批量调期**时，既有道具预约**随时段移动**（场次/起止更新，预约行不变）；移动后库存不足则
+     `409 PROP_CAPACITY_CONFLICT`，**原日程操作整体不生效**（时间与预约均不动）。
+4. 占用按带时区时段**归一化后的半开区间 `[start, end)`** 计算：同一道具任一时刻（可跨排练、跨剧本）
+   的有效预约总量不得超过库存；**端点相接可复用**（10:00–11:00 与 11:00–12:00 可各用满库存）。
+5. 导演可**一次修改多个时段**的道具预约（至少两条，可跨排练）：按**整批最终状态**统一校验；
+   任一时刻不足则**整批不生效**（该批所有写入随事务回滚），响应 `details.shortages` 逐条给出
+   **道具、峰值时刻、库存/峰值占用/缺口、冲突时段及各占件数**。
+6. 导演可查看任一时段的**预约明细与该时段内最低余量**（`minRemaining`：该时段区间内
+   “库存 − 含其他时段叠加的峰值占用”对全部已预约道具取最小值；待调整/已取消时段不占用，余量为 `null`）；
+   登记册列表另给每道具的有效预约时段数、峰值同时占用与当前余量。
+7. **演员只可查看自己当前参与的有效时段的道具清单**（仅道具名称与本时段件数，不见库存、余量与其他预约）；
+   非参与时段、待调整/已取消时段、登记册与任何写入接口均 `403`。演员与导演的日程列表均带 `props` 简表。
+
 ## 一键启动（Docker，推荐）
 
 前置：已安装 Docker 与 Docker Compose v2。
@@ -203,7 +225,8 @@ PORT=8080 docker compose up --build -d
 | 演员 | `zhou` | `actor123` | 周海，初始未派角 |
 
 演示数据包含剧本《夜航灯塔》（2 个场次、2 个角色、7 句台词，已发布 v1）和一个固定 v1 的排练
-（含一段 2026-10-10 的示例日程，该日程自带一条待林晚、陈默知悉确认的时段通知批次）。
+（含一段 2026-10-10 的示例日程，该日程自带一条待林晚、陈默知悉确认的时段通知批次；
+另登记煤油灯×2、道具佩剑×1、旧航海图×1 三件共享道具，并为示例时段预约煤油灯×1、佩剑×1）。
 
 ## 页面与操作路径
 
@@ -218,6 +241,11 @@ PORT=8080 docker compose up --build -d
   （整批校验冲突，成功后提示有实质变化并重发通知的条数，未变化不重发）；对有效时段**开启/查看/关闭到场登记**
   （名单、缺口、应到/签到/缺席统计）；在“知悉通知”列查看各时段**当前批次的已确认/待确认名单与
   历史批次**。排期/调期/派角/换版若撞上演员不可用时段，页面会提示冲突演员及其不可用时段与原因。
+- **导演 → 共享道具**：登记道具与非负整数总件数、调整总量（下调超占时整次拒绝），
+  查看每道具的有效预约时段数、峰值同时占用与当前余量。
+- **导演 → 排练与确认 → 日程行「道具」**：为每个时段填写/撤销各道具目标件数，查看该时段预约与时段内最低余量；
+  批量预约、调期携带移动、取消释放、待调整恢复校验均在接口层给出冲突时段与缺口。
+- **演员 → 我的排练时段**：自己当前参与的有效时段行内显示**共享道具清单**（名称×件数），不可见库存/余量/其他时段。
 - **导演 → 总览**：所有排练的待确认汇总与最近冲突详情。
 - **演员**：进入排练后仅显示本人角色台词，按场次点“确认本场台词”；换版或改派后相应场次会回到待确认；
   可查看自己当前参与的排练时段，并在登记开放期为本人**到场签到**；
@@ -262,12 +290,16 @@ PORT=8080 docker compose up --build -d
 | POST | `/api/schedule-notifications/:id/confirm` | 演员确认当前有效批次（幂等重试返回首次时间；过期 409） |
 | GET/POST | `/api/me/unavailability` | 演员查看 / 登记本人不可用时段（带时区起止+原因，UTC 保存；撞本人有效日程 409） |
 | PATCH/DELETE | `/api/me/unavailability/:id` | 演员修改 / 撤销本人不可用时段（修改同样做重叠校验） |
+| GET/POST | `/api/props` | 共享道具登记册（仅导演）：查看 / 登记道具（名称+非负整数总件数） |
+| PATCH | `/api/props/:propId` | 调整道具总量/改名（导演；下调时校验全部有效预约，不足整次不生效） |
+| GET/PUT | `/api/rehearsals/:id/schedules/:sid/props` | 查看时段预约与最低余量（演员仅限本人参与的有效时段且只见清单）/ 填写道具目标件数（导演；`quantity=0` 撤销，未列出的道具不变） |
+| POST | `/api/schedules/props/batch` | 批量修改多个时段的道具预约（导演，至少两条，可跨排练）：整批最终状态校验，任一时刻不足整批不生效，返回道具/冲突时段/缺口 |
 | GET | `/api/dashboard` | 导演总览 |
 
 错误统一形如 `{ "error": "CODE", "message": "...", "details": ... }`，
 典型状态码：`400`（无效版本/场次/参数、状态不允许的操作）、`401`（未登录）、`403`（越权）、`404`（不存在）、
 `409`（业务冲突，如 `OLD_TEXT_MISMATCH`、`PUBLISH_CONFLICT`、`SCHEDULE_CONFLICT`、
-`UNAVAILABILITY_CONFLICT`、`ATTENDANCE_EXISTS`、`ATTENDANCE_NOT_OPEN`、`NOTIFICATION_EXPIRED`、`PREVIEW_STALE`）。
+`UNAVAILABILITY_CONFLICT`、`ATTENDANCE_EXISTS`、`ATTENDANCE_NOT_OPEN`、`NOTIFICATION_EXPIRED`、`PREVIEW_STALE`、`PROP_CAPACITY_CONFLICT`）。
 
 日程列表响应（导演与演员）均带 `notification` 摘要：导演见 `{id, seq, status, expected, confirmed, pending}`
 （仅当前批次计 `pending`）；演员见 `{id, seq, myState, confirmedAt}`（本人不在当前批次接收人中或无批次时为 `null`）。
@@ -662,6 +694,74 @@ curl -s -X POST http://localhost:3000/api/rehearsals/1/schedules \
 #    已有日程之间的互撞仍返回 409 SCHEDULE_CONFLICT，二者互不影响。
 ```
 
+## 共享道具接口调用示例（curl）
+
+```bash
+# 1. 导演登记道具（名称 + 非负整数总件数）
+curl -s -X POST http://localhost:3000/api/props \
+  -H "Authorization: Bearer <TOKEN>" -H 'Content-Type: application/json' \
+  -d '{"name":"煤油灯","totalCount":2}'
+# -> 201 {"ok":true,"prop":{"id":1,"name":"煤油灯","totalCount":2,
+#        "activeReservationCount":0,"peakReserved":0,"availableNow":2}}
+
+# 2. 为时段 2 填写目标件数（0 撤销；未列出的道具保持不变）
+curl -s -X PUT http://localhost:3000/api/rehearsals/1/schedules/2/props \
+  -H "Authorization: Bearer <TOKEN>" -H 'Content-Type: application/json' \
+  -d '{"items":[{"propId":1,"quantity":2},{"propId":2,"quantity":0}]}'
+# -> 200 {"ok":true,
+#        "schedule":{"id":2,"rehearsalId":1,"sceneId":1,"startAt":"...","endAt":"...","status":"active"},
+#        "props":[{"propId":1,"propName":"煤油灯","totalCount":2,"quantity":2,
+#          "occupying":true,"peakReservedInSlot":2,"minRemaining":0}],
+#        "minRemaining":0}
+#    仅有效时段占用；minRemaining = 库存 − 该时段区间内（含其他时段叠加）的峰值占用，对各道具取最小值。
+
+# 3. 同一道具任一时刻超库存 -> 409，整次不生效；返回道具、峰值时刻、冲突时段与缺口
+#    （时段 3 与时段 2 重叠且也要 2 盏煤油灯，库存只有 2）
+curl -s -X PUT http://localhost:3000/api/rehearsals/1/schedules/3/props \
+  -H "Authorization: Bearer <TOKEN>" -H 'Content-Type: application/json' \
+  -d '{"items":[{"propId":1,"quantity":2}]}'
+# -> 409 {"error":"PROP_CAPACITY_CONFLICT","message":"道具预约后库存不足，本次操作未生效",
+#        "details":{"shortages":[{"propId":1,"propName":"煤油灯","totalCount":2,
+#          "peakAt":"2026-10-03T07:00:00.000Z","peakReserved":4,"shortage":2,
+#          "schedules":[{"id":2,"rehearsalId":1,"sceneId":1,"quantity":2,"startAt":"...","endAt":"..."},
+#                       {"id":3,"rehearsalId":1,"sceneId":1,"quantity":2,"startAt":"...","endAt":"..."}]}]}}
+
+# 4. 一次修改多个时段（至少两条，可跨排练）；按整批最终状态校验，任一时刻不足整批不生效
+curl -s -X POST http://localhost:3000/api/schedules/props/batch \
+  -H "Authorization: Bearer <TOKEN>" -H 'Content-Type: application/json' \
+  -d '{"items":[
+    {"scheduleId":2,"propId":1,"quantity":1},
+    {"scheduleId":5,"propId":1,"quantity":1}
+  ]}'
+# -> 200 {"ok":true,"schedules":[{...时段2预约视图...},{...时段5预约视图...}]}
+#    同批重复 (scheduleId, propId) -> 400；未知道时段 404；未知道具/无效件数 400。
+
+# 5. 调期 / 批量调期 / 待调整恢复有效：既有预约随时段移动；移动后库存不足 -> 原日程操作整体不生效
+curl -s -X PATCH http://localhost:3000/api/rehearsals/1/schedules/2 \
+  -H "Authorization: Bearer <TOKEN>" -H 'Content-Type: application/json' \
+  -d '{"startAt":"2026-10-04T14:00:00+08:00","endAt":"2026-10-04T15:00:00+08:00"}'
+# -> 409 {"error":"PROP_CAPACITY_CONFLICT",
+#        "message":"调期后共享道具库存不足（既有预约随时段移动），本次日程操作整体不生效", ...}
+#    端点相接（如一端 endAt 等于另一端 startAt）不算叠加，可各用满库存。
+
+# 6. 下调道具总量：按全部有效预约校验，不足整次不生效（上调与改名不受限）
+curl -s -X PATCH http://localhost:3000/api/props/1 \
+  -H "Authorization: Bearer <TOKEN>" -H 'Content-Type: application/json' \
+  -d '{"totalCount":1}'
+# -> 409 {"error":"PROP_CAPACITY_CONFLICT","message":"下调后道具库存不足以覆盖现有有效预约，本次调整未生效", ...}
+
+# 7. 取消时段 -> 预约释放占用（记录保留可查，occupying=false、minRemaining=null），且不能再修改
+curl -s -X POST http://localhost:3000/api/rehearsals/1/schedules/2/cancel \
+  -H "Authorization: Bearer <TOKEN>"
+# 换版转待调整同样释放；待调整时段可改预约（不校验占用），恢复有效（PATCH/batch-adjust）时重新校验。
+
+# 8. 演员只可查看自己当前参与的有效时段道具清单（无库存/余量字段）；其他时段 403
+curl -s http://localhost:3000/api/rehearsals/1/schedules/2/props \
+  -H "Authorization: Bearer <ACTOR_TOKEN>"
+# -> 200 {"scheduleId":2,"status":"active",
+#        "props":[{"propId":1,"propName":"煤油灯","quantity":2}]}
+```
+
 ## 测试
 
 端到端测试会用临时数据目录自动起停服务器，覆盖：认证与越权、修订原文校验、
@@ -679,7 +779,10 @@ curl -s -X POST http://localhost:3000/api/rehearsals/1/schedules \
 已取消与待调整不参与、与本人有效日程重叠整次拒绝、导演排期/调期/派角/换版撞不可用整次不生效、
 不改写已开启的到场登记）、时段通知（创建/调整/派角/撤派/换版生成批次与冻结快照、
 无实质变化不重复生成、确认幂等与过期拒绝、取消/待调整不计待确认与恢复生成新批次、
-冲突失败不留批次、不影响签到名单与逐场确认）等：
+冲突失败不留批次、不影响签到名单与逐场确认）、
+共享道具（登记/改名/调总量与下调校验、单条与跨排练批量预约、无效件数/未知道具时段/同批重复组合拒绝、
+半开区间与端点相接、撤销(0)与未列出项不变、整批最终状态校验与回滚、调期与批量调期携带预约移动超占整体不生效、
+取消/转待调整释放占用、恢复有效重新校验、演员仅见本人参与有效时段清单且越权 403、日程列表 props 简表）等：
 
 ```bash
 npm test
@@ -703,6 +806,8 @@ src/
   attendance.js    到场登记（开启冻结名单/缺口、本人签到、关闭记缺席、作废与统计）
   unavailability.js 演员不可用时段（登记/修改/撤销/本人查看，与本人有效日程重叠即整次拒绝）
   notifications.js 时段通知（知悉确认）：导演查看批次名单与历史、演员本人批次列表与幂等确认
+  props.js         剧团共享道具：登记册与总量调整、时段预约（单条/批量，半开区间库存扫描线）、
+                   容量冲突（道具/冲突时段/缺口）、调期集成校验、演员可见性
   server.js        Express 入口
 public/            原生 JS 单页前端
 scripts/           安装兜底脚本与端到端测试
